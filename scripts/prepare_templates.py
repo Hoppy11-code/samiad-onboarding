@@ -120,6 +120,39 @@ def replace_in_paragraph(p, func) -> None:
             r.text = t
 
 
+def merge_course_and_specialism(doc) -> None:
+    """'<Course>, <specialism>' becomes one value so a blank specialism leaves no stray comma."""
+    for p in all_paragraphs(doc):
+        t = p.text
+        if "{{ s.course }}," in t and "{{ s.specialism }}" in t:
+            new = re.sub(r"\{\{ s\.course \}\},\s*\{\{ s\.specialism \}\}", "{{ s.programme }}", t)
+            set_text(p, new.strip())
+
+
+def unwrap_content_controls(doc) -> None:
+    """Remove Word content controls (old Dynamics bindings such as the sales
+    adviser's name) and keep their visible text, so it can be replaced."""
+    parts = [doc.element.body] + [s.header._element for s in doc.sections] + \
+            [s.footer._element for s in doc.sections]
+    for root in parts:
+        for sdt in list(root.iter(qn("w:sdt"))):
+            content = sdt.find(qn("w:sdtContent"))
+            parent = sdt.getparent()
+            if parent is None:
+                continue
+            idx = parent.index(sdt)
+            for child in (list(content) if content is not None else []):
+                parent.insert(idx, child)
+                idx += 1
+            parent.remove(sdt)
+
+
+def replace_text_everywhere(doc, old: str, new: str) -> None:
+    for t in doc.element.body.iter(qn("w:t")):
+        if t.text and old in t.text:
+            t.text = t.text.replace(old, new)
+
+
 def tag(placeholder: str) -> str | None:
     expr = expression_for(placeholder)
     return "{{ " + expr + " }}" if expr else None
@@ -205,9 +238,11 @@ def insert_row_like(row, text: str, before: bool):
 # --------------------------------------------------------------------------
 def prepare_confirmation(src: Path, dst: Path, gross: bool) -> None:
     d = docx.Document(src)
+    unwrap_content_controls(d)
     for p in all_paragraphs(d):
         replace_in_paragraph(p, tag)
 
+    merge_course_and_specialism(d)
     pars = d.paragraphs
     heading = next(p for p in pars if p.text.strip().startswith("Student Details"))
     details, fees = d.tables[0], d.tables[1]
@@ -239,6 +274,9 @@ def prepare_confirmation(src: Path, dst: Path, gross: bool) -> None:
 
 def prepare_receipt(src: Path, dst: Path) -> None:
     d = docx.Document(src)
+    unwrap_content_controls(d)
+    replace_text_everywhere(d, "Sam Allen", "{{ owner_name }}")
+    replace_text_everywhere(d, "sam@samiad.com", "{{ owner_email }}")
     for p in all_paragraphs(d):
         replace_in_paragraph(p, tag)
 
@@ -291,8 +329,10 @@ def prepare_receipt(src: Path, dst: Path) -> None:
 
 def prepare_visa(src: Path, dst: Path) -> None:
     d = docx.Document(src)
+    unwrap_content_controls(d)
     for p in all_paragraphs(d):
         replace_in_paragraph(p, tag)
+    merge_course_and_specialism(d)
     for p in all_paragraphs(d):
         t = p.text
         if "Box Hill School" in t:
