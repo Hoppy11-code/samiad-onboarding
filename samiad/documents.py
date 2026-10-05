@@ -162,11 +162,29 @@ def docx_text(docx_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
+def _soffice() -> str:
+    """LibreOffice's command: on PATH (Linux/Railway) or the usual Windows/Mac install folder."""
+    import os
+    import shutil
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                 "/Applications/LibreOffice.app/Contents/MacOS/soffice"):
+        if os.path.exists(path):
+            return path
+    raise RuntimeError("LibreOffice not found: install it from libreoffice.org")
+
+
 def to_pdf(docx_bytes: bytes) -> bytes:
+    import os
     with tempfile.TemporaryDirectory() as tmp:
         src = Path(tmp) / "doc.docx"
         src.write_bytes(docx_bytes)
-        subprocess.run(["soffice", "--headless", "--norestore", "--convert-to", "pdf",
-                        "--outdir", tmp, str(src)], check=True, capture_output=True, timeout=180,
-                       env={"HOME": tmp, "PATH": "/usr/bin:/bin:/usr/local/bin"})
+        profile = Path(tmp, "profile").resolve().as_uri()  # private profile: safe if Word/LibreOffice is open
+        subprocess.run([_soffice(), f"-env:UserInstallation={profile}", "--headless", "--norestore",
+                        "--convert-to", "pdf", "--outdir", tmp, str(src)],
+                       check=True, capture_output=True, timeout=180, env={**os.environ, "HOME": tmp})
         return (Path(tmp) / "doc.pdf").read_bytes()
