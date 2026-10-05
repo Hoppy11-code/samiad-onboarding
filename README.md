@@ -113,5 +113,10 @@ email wording (`templates/emails/fifty_percent.html`).
 * `net_total_calculated` / `gross_total_calculated` on the deal are written by
   the service. If HubSpot rejects that (e.g. they're calculated properties),
   invoicing carries on and Teams gets one alert.
+* Dates of birth are stored in HubSpot as text, month first (e.g. 10/31/1976),
+  and are read that way. One typed day-first would print wrongly on a visa
+  letter, so glance at DOBs when checking a letter.
+* Adding a student to an existing deal may not count as a change in HubSpot;
+  edit any field on the student (or the deal) to make the next run pick it up.
 * Unmatched bank receipts are not in the daily check yet (needs the Xero
   bank-transactions permission).
