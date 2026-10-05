@@ -65,7 +65,7 @@ class Settings:
     run_hours: tuple[int, int]      # local hours, inclusive
     run_weekdays_only: bool
     season_label: str               # e.g. "2027", used in folder names
-    season_start: date              # deals created before this are never touched
+    season_start: date              # only bookings whose students arrive on/after this
     payment_terms_days: int
     account_codes: dict
     # HubSpot
@@ -107,7 +107,7 @@ def load() -> Settings:
         run_hours=(start, end),
         run_weekdays_only=_bool("RUN_WEEKDAYS_ONLY", True),
         season_label=_env("SEASON", "2027"),
-        season_start=date.fromisoformat(_env("SEASON_START", "2026-09-01")),
+        season_start=date.fromisoformat(_env("SEASON_ARRIVALS_FROM", "2027-01-01")),
         payment_terms_days=int(_env("PAYMENT_TERMS_DAYS", "14")),
         account_codes=codes,
         hubspot_token=_env("HUBSPOT_TOKEN"),

@@ -286,7 +286,7 @@ def test_stale_approval_tick_is_cleared_not_reused(env):
 
 def test_previous_season_deal_is_never_touched(env):
     svc, hs, xero, graph, teams = env
-    hs.deals["900000000001"]["createdate"] = "2025-11-01T09:00:00Z"
+    hs.contacts["s1"]["arrival_dats"] = "2026-07-22"
     svc.process("900000000001")
     assert not xero.invoices
 

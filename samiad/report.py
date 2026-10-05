@@ -72,7 +72,7 @@ def daily_report(svc) -> list[str]:
         {"propertyName": "samiad_managed", "operator": "NOT_HAS_PROPERTY"},
         {"propertyName": "samiad_status", "operator": "NOT_HAS_PROPERTY"},
         {"propertyName": "hs_v2_date_entered_current_stage", "operator": "LT", "value": cutoff},
-        {"propertyName": "createdate", "operator": "GTE", "value": str(int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp() * 1000))},
+        {"propertyName": "closedate", "operator": "GTE", "value": str(int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp() * 1000))},
     ], ["dealname"])
     for d in uninvoiced[:25]:
         issues.append(f"{d['properties'].get('dealname')}: Closed Won over 24 hours ago but not invoiced")

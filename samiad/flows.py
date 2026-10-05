@@ -170,11 +170,6 @@ class Service:
         name = p.get("dealname") or deal_id
         managed = (p.get("samiad_managed") or "").lower() == "true"
 
-        # only this season's bookings: a returner's old deal must never be re-invoiced
-        created = _hs_time(p.get("createdate"))
-        if created and created.date() < self.s.season_start:
-            return None
-
         if p.get("dealstage") not in self.hs.closed_won_stages():
             if managed:
                 self.alert(deal_id, "Invoiced booking is no longer Closed Won",
@@ -201,7 +196,14 @@ class Service:
         for st in students:
             st.props["_nights"] = docs.nights(st)
 
+        # only this season's bookings: a returner's old deal must never be re-invoiced
+        arrivals = [docs.parse_date(st.p("arrival_dats")) for st in students]
+        if any(a and a < self.s.season_start for a in arrivals):
+            return None
+
         try:
+            if students and not all(arrivals):
+                raise BlockedError("A student has no arrival date")
             basis = billing_basis(pipeline, (company or {}).get("properties", {}).get("billing_basis"))
             if b2b and not company:
                 raise BlockedError("No agent company is attached to this deal")
