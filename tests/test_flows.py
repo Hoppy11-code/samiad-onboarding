@@ -152,7 +152,7 @@ def student(cid, net="1350", gross="1900", ins="12"):
             "departure_date": "2027-07-29", "date_of_birth": "9/21/2012", "nationality": "Italian",
             "passport_number": "YA123", "net_price__": net, "gross_price__": gross, "insurance_fee__": ins,
             "airport_transfer_fee": "0", "airport_transfers": "Return Transfers", "ensuite_supplement": "0",
-            "unaccompanied_minor_fee": "0", "pre_post_online_course__": "0",
+            "unaccompanied_minor_fee": "0", "pre_post_online_course__": "0", "visiting_year": "2027",
             "total_net_fee": str(D(net) + D(ins)), "gross_fee__total_": str(D(gross) + D(ins))}
 
 
@@ -165,7 +165,7 @@ def env(tmp_path, monkeypatch):
     entered = str(int((NOW - timedelta(hours=2)).timestamp() * 1000))
     hs.deals["900000000001"] = {"dealname": "Rossi family", "pipeline": PIPELINE_B2C_SALES, "dealstage": WON,
                                 "hubspot_owner_id": "1", "hs_v2_date_entered_current_stage": entered,
-                                "createdate": "2026-10-01T09:00:00Z"}
+                                "createdate": "2026-10-01T09:00:00Z", "visiting_year": "2027"}
     hs.contacts["s1"] = student("s1")
     hs.contacts["p1"] = {"contact_type": "Parent / Guardian", "firstname": "Maria", "lastname": "Rossi"}
     hs.deal_contacts_map["900000000001"] = ["s1", "p1"]
@@ -286,9 +286,24 @@ def test_stale_approval_tick_is_cleared_not_reused(env):
 
 def test_previous_season_deal_is_never_touched(env):
     svc, hs, xero, graph, teams = env
-    hs.contacts["s1"]["arrival_dats"] = "2026-07-22"
+    hs.deals["900000000001"]["visiting_year"] = "2026"
     svc.process("900000000001")
     assert not xero.invoices
+
+
+def test_old_student_record_on_this_years_deal_blocks(env):
+    svc, hs, xero, graph, teams = env
+    hs.contacts["s1"]["visiting_year"] = "2026"
+    svc.process("900000000001")
+    assert not xero.invoices
+    assert "Visiting year" in hs.deals["900000000001"]["samiad_status"]
+
+
+def test_blank_deal_year_falls_back_to_students(env):
+    svc, hs, xero, graph, teams = env
+    hs.deals["900000000001"].pop("visiting_year")
+    svc.process("900000000001")
+    assert "900000000001" in xero.invoices
 
 
 def test_voided_base_on_managed_deal_is_not_recreated(env):

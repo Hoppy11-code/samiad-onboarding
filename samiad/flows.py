@@ -46,6 +46,16 @@ def OWN_NUMBER(deal_id: str, number: str) -> bool:
     return re.fullmatch(rf"{deal_id}(-(CN)?\d+)?", number) is not None
 
 
+def _year(value) -> str | None:
+    """HubSpot number fields arrive as '2027' or '2027.0'."""
+    if value in (None, ""):
+        return None
+    try:
+        return str(int(float(value)))
+    except ValueError:
+        return None
+
+
 def _hs_time(value) -> datetime | None:
     if not value:
         return None
@@ -196,13 +206,21 @@ class Service:
         for st in students:
             st.props["_nights"] = docs.nights(st)
 
-        # only this season's bookings: a returner's old deal must never be re-invoiced
-        arrivals = [docs.parse_date(st.p("arrival_dats")) for st in students]
-        if any(a and a < self.s.season_start for a in arrivals):
+        # only this season's bookings (Visiting year): a returner's old deal is never re-invoiced
+        season = self.s.season_label
+        deal_year = _year(p.get("visiting_year"))
+        student_years = [_year(st.p("visiting_year")) for st in students]
+        if deal_year is None and not (student_years and all(y == season for y in student_years)):
+            return None
+        if deal_year is not None and deal_year != season:
             return None
 
         try:
-            if students and not all(arrivals):
+            wrong = [st.name for st, y in zip(students, student_years) if y not in (None, season)]
+            if wrong:
+                raise BlockedError(f"Visiting year on {', '.join(wrong)} isn't {season} "
+                                   "(an old student record may be attached)")
+            if students and not all(docs.parse_date(st.p("arrival_dats")) for st in students):
                 raise BlockedError("A student has no arrival date")
             basis = billing_basis(pipeline, (company or {}).get("properties", {}).get("billing_basis"))
             if b2b and not company:
