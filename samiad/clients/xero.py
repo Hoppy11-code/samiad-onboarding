@@ -60,7 +60,13 @@ class Xero:
             self.store.set("xero_tenant_id", self.tenant_id)
         return self._access
 
+    def count_call(self) -> None:
+        """Xero's free tier allows 1,000 calls a day; keep a tally for the daily check."""
+        key = f"xero_calls:{date.today().isoformat()}"
+        self.store.set(key, (self.store.get(key) or 0) + 1)
+
     def _req(self, method: str, path: str, idem: str | None = None, **kw):
+        self.count_call()
         headers = {"Authorization": f"Bearer {self._token()}", "Xero-tenant-id": self.tenant_id,
                    "Accept": "application/json"}
         if idem:
@@ -81,16 +87,26 @@ class Xero:
         cn_where = f'CreditNoteNumber.StartsWith("{deal_id}") AND Type=="ACCRECCREDIT"'
         for cn in self._req("GET", "/CreditNotes", params={"where": cn_where, "page": 1}).json().get("CreditNotes", []):
             raw[cn["CreditNoteNumber"]] = cn
+        # how much of each invoice was settled by OUR credit notes (vs prepayments/overpayments)
+        ours: dict[str, Decimal] = {}
+        for num, rec in raw.items():
+            if "CreditNoteID" in rec and DEAL_ID.match(num):
+                for a in rec.get("Allocations", []) or []:
+                    iid = (a.get("Invoice") or {}).get("InvoiceID")
+                    if iid:
+                        ours[iid] = ours.get(iid, money(0)) + money(a.get("Amount"))
         docs = []
         for num, rec in raw.items():
             m = DEAL_ID.match(num)
             if not m or m.group(1) != deal_id:
                 continue  # e.g. old Zapier "id - date N" invoices: not part of the managed chain
             is_cn = "CreditNoteID" in rec
+            our_credit = ours.get(rec.get("InvoiceID"), money(0))
+            other_credit = money(rec.get("AmountCredited")) - our_credit  # prepayments, overpayments
             docs.append(ChainDoc(
                 number=num, total=money(rec.get("Total")),
-                paid=money(rec.get("AmountPaid")) if not is_cn else money(0),
-                credited=money(rec.get("AmountCredited")) if not is_cn else money(0),
+                paid=(money(rec.get("AmountPaid")) + max(other_credit, money(0))) if not is_cn else money(0),
+                credited=our_credit if not is_cn else money(0),
                 status=rec.get("Status", ""), is_credit_note=is_cn,
                 xero_id=rec.get("CreditNoteID") if is_cn else rec.get("InvoiceID"),
             ))
@@ -100,7 +116,9 @@ class Xero:
         """Numbers of ANY sales invoice mentioning this deal ID (used for cutover)."""
         where = f'InvoiceNumber.Contains("{deal_id}") AND Type=="ACCREC" AND Status!="VOIDED" AND Status!="DELETED"'
         invs = self._req("GET", "/Invoices", params={"where": where}).json().get("Invoices", [])
-        return [i["InvoiceNumber"] for i in invs]
+        # Contains() would also match this ID inside a longer one; keep exact-ID hits only
+        pat = re.compile(rf"(?<!\d){deal_id}(?!\d)")
+        return [i["InvoiceNumber"] for i in invs if pat.search(i["InvoiceNumber"])]
 
     def invoice(self, invoice_id: str) -> dict:
         return self._req("GET", f"/Invoices/{invoice_id}").json()["Invoices"][0]
@@ -109,6 +127,7 @@ class Xero:
         out, page = [], 1
         hdr = {"If-Modified-Since": since.strftime("%Y-%m-%dT%H:%M:%S")}
         while True:
+            self.count_call()
             resp = request(self.http, "Xero", "GET", API + "/Invoices",
                            headers={"Authorization": f"Bearer {self._token()}",
                                     "Xero-tenant-id": self.tenant_id, "Accept": "application/json", **hdr},
@@ -130,15 +149,35 @@ class Xero:
             page += 1
 
     # ---- contacts ---------------------------------------------------------
-    def find_or_create_contact(self, name: str, existing_id: str = "") -> str:
+    def find_or_create_contact(self, name: str, existing_id: str = "", account_number: str = "") -> str:
+        """Xero contact for an agent company / parent, keyed by HubSpot record id.
+
+        account_number (e.g. 'HS-C-123') is stored on the Xero contact, so two
+        customers with the same name never share a contact. Names must be
+        unique in Xero, so a clash gets ' (2)' etc.
+        """
         if existing_id:
             return existing_id
+        if account_number:
+            found = self._req("GET", "/Contacts", params={
+                "where": f'AccountNumber=="{account_number}"'}).json().get("Contacts", [])
+            if found:
+                return found[0]["ContactID"]
         safe = name.replace('"', "")
-        found = self._req("GET", "/Contacts", params={"where": f'Name=="{safe}"'}).json().get("Contacts", [])
-        if found:
-            return found[0]["ContactID"]
-        resp = self._req("PUT", "/Contacts", idem=f"contact-{safe}",
-                         json={"Contacts": [{"Name": name}]}).json()
+        candidate, n = safe, 1
+        while True:
+            clash = self._req("GET", "/Contacts", params={"where": f'Name=="{candidate}"'}).json().get("Contacts", [])
+            if not clash:
+                break
+            if not account_number and clash:
+                return clash[0]["ContactID"]
+            n += 1
+            candidate = f"{safe} ({n})"
+        body = {"Name": candidate}
+        if account_number:
+            body["AccountNumber"] = account_number
+        resp = self._req("PUT", "/Contacts", idem=f"contact-{account_number or candidate}",
+                         json={"Contacts": [body]}).json()
         return resp["Contacts"][0]["ContactID"]
 
     def set_contact_email(self, contact_id: str, email: str) -> None:
@@ -205,5 +244,6 @@ class Xero:
 
 def invoice_line_signature(rec: dict) -> list[tuple[str, str]]:
     """(description, amount) pairs from a raw Xero invoice, for comparing lines."""
-    return sorted((li.get("Description", ""), str(money(li.get("LineAmount", li.get("UnitAmount")))))
+    return sorted((" ".join((li.get("Description") or "").split()),
+                   str(money(li.get("LineAmount", li.get("UnitAmount")))))
                   for li in rec.get("LineItems", []))

@@ -127,9 +127,8 @@ def booking_lines(students: list[Student], basis: Basis) -> list[Line]:
             )
         course = s.p("course") or "Summer course"
         nights = s.p("_nights")
-        desc = f"{s.name} - {course}, {s.p('campus') or ''}"
-        if nights:
-            desc += f", {nights} nights"
+        parts = [course, s.p("campus") or "", f"{nights} nights" if nights else ""]
+        desc = f"{s.name} - " + ", ".join(x for x in parts if x)
         lines.append(Line(desc, s.course_price(basis), "course", s.contact_id))
         for prop, _label, xero_desc in ADDONS:
             amt = s.addon(prop)

@@ -99,9 +99,9 @@ Originals from Samiad are in `templates/source/` (never edited by code).
 per-student rows for groups, receipt layout, deal owner instead of Sam Allen).
 To change wording: edit the source file in Word, then re-run the script.
 
-Still to come: Ministay visa letter (`templates/visa_ministay_net.docx` /
-`_gross.docx`; until then the standard letter is used) and the real 50% email
-wording (`templates/emails/fifty_percent.html`).
+Ministay bookings (always B2B groups) use the same templates; only the address
+on the visa letter differs (`MINISTAY_ADDRESS`). Still to come: the real 50%
+email wording (`templates/emails/fifty_percent.html`).
 
 ## Known limits / to check at first test
 

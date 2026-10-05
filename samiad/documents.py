@@ -140,12 +140,13 @@ def receipt_docx(b: BookingDocs) -> bytes:
 
 
 def visa_docx(b: BookingDocs, student_index: int, ministay: bool = False) -> bytes:
+    """Ministay uses the same (group) letter; only the address differs."""
+    import os
     ctx = b.context()
     ctx["s"] = ctx["students"][student_index]
-    name = f"visa_ministay_{_suffix(b.basis)}.docx" if ministay else f"visa_{_suffix(b.basis)}.docx"
-    if not (TEMPLATES / name).exists():
-        name = f"visa_{_suffix(b.basis)}.docx"
-    return _render(name, ctx)
+    if ministay and os.environ.get("MINISTAY_ADDRESS"):
+        ctx["s"]["campus_address"] = os.environ["MINISTAY_ADDRESS"]
+    return _render(f"visa_{_suffix(b.basis)}.docx", ctx)
 
 
 def to_pdf(docx_bytes: bytes) -> bytes:

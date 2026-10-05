@@ -17,7 +17,7 @@ STUDENT_PROPS = [
     "pre_post_online_course__", "total_net_fee", "gross_fee__total_", "lastmodifieddate",
 ]
 DEAL_PROPS = [
-    "dealname", "pipeline", "dealstage", "hubspot_owner_id", "closedate", "hs_lastmodifieddate",
+    "dealname", "createdate", "pipeline", "dealstage", "hubspot_owner_id", "closedate", "hs_lastmodifieddate",
     "hs_v2_date_entered_current_stage", "net_total_calculated", "gross_total_calculated",
     "campus", "arrival_date", "departure_date", "start_date_of_course", "number_of_nights",
     "invoice_amount", "xero_invoice_number", "payment_status", "total_paid", "remaining_balance",

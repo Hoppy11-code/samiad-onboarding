@@ -70,7 +70,7 @@ class FakeXero:
         return [n for n in self.legacy if deal_id in n] + [n for n in self.invoices if deal_id in n]
 
     # writes
-    def find_or_create_contact(self, name, existing=""):
+    def find_or_create_contact(self, name, existing="", account_number=""):
         return existing or f"contact-{name}"
 
     def set_contact_email(self, cid, email):
@@ -164,7 +164,8 @@ def env(tmp_path, monkeypatch):
     svc = flows.Service(s, hs, xero, graph, teams, Store(tmp_path), now=NOW)
     entered = str(int((NOW - timedelta(hours=2)).timestamp() * 1000))
     hs.deals["900000000001"] = {"dealname": "Rossi family", "pipeline": PIPELINE_B2C_SALES, "dealstage": WON,
-                                "hubspot_owner_id": "1", "hs_v2_date_entered_current_stage": entered}
+                                "hubspot_owner_id": "1", "hs_v2_date_entered_current_stage": entered,
+                                "createdate": "2026-10-01T09:00:00Z"}
     hs.contacts["s1"] = student("s1")
     hs.contacts["p1"] = {"contact_type": "Parent / Guardian", "firstname": "Maria", "lastname": "Rossi"}
     hs.deal_contacts_map["900000000001"] = ["s1", "p1"]
@@ -269,6 +270,71 @@ def test_big_change_waits_for_approval(env):
     svc.process("900000000001")
     assert xero.invoices["900000000001-1"]["Total"] == D("1650")
     assert hs.deals["900000000001"]["approve_change"] == "false"
+
+
+def test_stale_approval_tick_is_cleared_not_reused(env):
+    svc, hs, xero, graph, teams = env
+    svc.process("900000000001")
+    hs.deals["900000000001"]["approve_change"] = "true"       # ticked with nothing pending
+    svc.process("900000000001")
+    assert hs.deals["900000000001"]["approve_change"] == "false"
+    xero.pay("900000000001", "500")
+    hs.contacts["s1"] = student("s1", net="3000")
+    svc.process("900000000001")
+    assert "900000000001-1" not in xero.invoices                # still waits for a fresh tick
+
+
+def test_previous_season_deal_is_never_touched(env):
+    svc, hs, xero, graph, teams = env
+    hs.deals["900000000001"]["createdate"] = "2025-11-01T09:00:00Z"
+    svc.process("900000000001")
+    assert not xero.invoices
+
+
+def test_voided_base_on_managed_deal_is_not_recreated(env):
+    svc, hs, xero, graph, teams = env
+    svc.process("900000000001")
+    xero.invoices["900000000001"]["Status"] = "VOIDED"
+    svc.process("900000000001", xero_changed=True)
+    assert len(xero.invoices) == 1
+    assert hs.deals["900000000001"]["samiad_status"].startswith("Blocked: base invoice")
+
+
+def test_own_invoice_is_not_mistaken_for_legacy(env):
+    svc, hs, xero, graph, teams = env
+    svc.process("900000000001")
+    hs.deals["900000000001"].pop("samiad_managed")             # e.g. the HubSpot write had failed
+    svc.process("900000000001")
+    assert not hs.deals["900000000001"].get("samiad_status", "").startswith("Not managed")
+    assert len(xero.invoices) == 1
+
+
+def test_unchanged_deal_skips_xero(env):
+    svc, hs, xero, graph, teams = env
+    svc.process("900000000001")
+    calls = []
+    xero.chain = lambda d, _orig=xero.chain: calls.append(d) or _orig(d)
+    svc.process("900000000001", xero_changed=False)
+    assert calls == []
+
+
+def test_shadow_state_does_not_leak_into_live(env):
+    svc, hs, xero, graph, teams = env
+    svc.s = replace(svc.s, shadow_mode=True)
+    svc.process("900000000001")
+    svc.s = replace(svc.s, shadow_mode=False)
+    svc.process("900000000001")
+    assert "900000000001" in xero.invoices and hs.deals["900000000001"]["samiad_managed"] == "true"
+
+
+def test_failed_deal_is_retried(env, monkeypatch):
+    svc, hs, xero, graph, teams = env
+    hs.students_modified_since = lambda since: []
+    hs.closed_won_deals_modified_since = lambda since: [{"id": "900000000001"}]
+    xero.invoices_modified_since = lambda since: []
+    monkeypatch.setattr(svc, "process", lambda d, xero_changed=True: (_ for _ in ()).throw(RuntimeError("Xero down")))
+    svc.run()
+    assert svc.sget("deferred") == ["900000000001"]
 
 
 def test_shadow_mode_writes_nothing(env, tmp_path):

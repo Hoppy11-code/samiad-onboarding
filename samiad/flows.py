@@ -32,6 +32,20 @@ def _safe(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|#%]+', "-", name).strip(" .") or "Unnamed"
 
 
+def lines_signature(lines) -> list[tuple[str, str]]:
+    return sorted((" ".join(l.description.split()), str(l.amount)) for l in lines)
+
+
+def lines_hash(lines) -> str:
+    import hashlib
+    return hashlib.sha256(repr(lines_signature(lines)).encode()).hexdigest()[:16]
+
+
+def OWN_NUMBER(deal_id: str, number: str) -> bool:
+    """Invoice numbers this service creates for a deal: 123, 123-1, 123-CN1."""
+    return re.fullmatch(rf"{deal_id}(-(CN)?\d+)?", number) is not None
+
+
 def _hs_time(value) -> datetime | None:
     if not value:
         return None
@@ -60,11 +74,18 @@ class Service:
             return None
         return fn(*args, **kwargs)
 
+    # state is kept separately in shadow mode, so a shadow trial never changes live behaviour
+    def sget(self, key: str, default=None):
+        return self.store.get(("shadow:" if self.s.shadow_mode else "") + key, default)
+
+    def sset(self, key: str, value) -> None:
+        self.store.set(("shadow:" if self.s.shadow_mode else "") + key, value)
+
     def once(self, key: str, signature: str) -> bool:
         """True the first time a (key, signature) pair is seen: stops hourly repeats."""
-        if self.store.get(f"once:{key}") == signature:
+        if self.sget(f"once:{key}") == signature:
             return False
-        self.store.set(f"once:{key}", signature)
+        self.sset(f"once:{key}", signature)
         return True
 
     def alert(self, deal_id: str, title: str, lines: list[str], once_sig: str | None = None):
@@ -81,9 +102,9 @@ class Service:
 
     def set_status(self, deal_id: str, status: str):
         key = f"status:{deal_id}"
-        if self.store.get(key) == status:
+        if self.sget(key) == status:
             return
-        self.store.set(key, status)
+        self.sset(key, status)
         self.write(deal_id, f"status: {status}", self.hs.update, "deals", deal_id,
                    {"samiad_status": status[:250]})
 
@@ -91,49 +112,66 @@ class Service:
     # the hourly run
     # ------------------------------------------------------------------
     def run(self) -> None:
-        cursor = _hs_time(self.store.get("cursor")) or (self.now - timedelta(hours=2))
+        cursor = _hs_time(self.sget("cursor")) or (self.now - timedelta(hours=2))
         quiet_until = self.now - timedelta(minutes=10)  # leave half-finished edits alone
-        candidates: set[str] = set(self.store.get("deferred", []))
+        window = cursor - timedelta(minutes=15)
+        retry: set[str] = set(self.sget("deferred", []))        # waiting, blocked or errored
+        from_hubspot: set[str] = set()
+        from_xero: set[str] = set()
 
         # 0. student sync: changed students -> their deals
-        for c in self.hs.students_modified_since(cursor - timedelta(minutes=15)):
+        for c in self.hs.students_modified_since(window):
             modified = _hs_time(c["properties"].get("lastmodifieddate"))
             if modified and modified > quiet_until:
-                continue  # picked up next run
-            candidates.update(self.hs.contact_deals(c["id"]))
+                retry.update(self.hs.contact_deals(c["id"]))   # look again next run
+                continue
+            from_hubspot.update(self.hs.contact_deals(c["id"]))
 
-        # deals changed directly (stage moved to Closed Won, resync/approve ticked)
-        for d in self.hs.closed_won_deals_modified_since(cursor - timedelta(minutes=15)):
-            candidates.add(d["id"])
+        # deals changed directly (stage moved to Closed Won, approve ticked, agent basis etc.)
+        for d in self.hs.closed_won_deals_modified_since(window):
+            from_hubspot.add(d["id"])
+        # agents whose billing basis was just set: re-check their blocked deals (already in retry)
 
         # payments: Xero invoices changed since last run -> their deals
-        for inv in self.xero.invoices_modified_since(cursor - timedelta(minutes=15)):
-            m = re.match(r"^(\d{9,13})(?:-\d+)?$", inv.get("InvoiceNumber", ""))
+        for inv in self.xero.invoices_modified_since(window):
+            m = re.match(r"^(\d{9,13})(?:-(?:CN)?\d+)?$", inv.get("InvoiceNumber", ""))
             if m:
-                candidates.add(m.group(1))
+                from_xero.add(m.group(1))
 
-        deferred: set[str] = set()
-        for deal_id in sorted(candidates):
+        next_retry: set[str] = set()
+        for deal_id in sorted(retry | from_hubspot | from_xero):
             try:
-                if self.process(deal_id) == "defer":
-                    deferred.add(deal_id)
+                result = self.process(deal_id, xero_changed=deal_id in from_xero)
+                if result in ("defer", "blocked"):
+                    next_retry.add(deal_id)
+                self.sset(f"errors:{deal_id}", 0)
             except Exception as e:
                 log.exception("deal %s failed", deal_id)
                 self.store.log(deal_id, "error", traceback.format_exc()[-2000:], self.s.shadow_mode)
+                n = (self.sget(f"errors:{deal_id}") or 0) + 1
+                self.sset(f"errors:{deal_id}", n)
+                if n < 6:
+                    next_retry.add(deal_id)
                 self.alert(deal_id, "Booking automation hit an error",
-                           [f"Deal {deal_id}: {str(e)[:300]}", "It will retry next hour."],
-                           once_sig=str(e)[:100])
-        self.store.set("deferred", sorted(deferred))
-        self.store.set("cursor", quiet_until.isoformat())
+                           [f"Deal {deal_id}: {str(e)[:300]}",
+                            "It will retry next hour." if n < 6 else "Gave up after 6 tries: needs a person."],
+                           once_sig=f"{str(e)[:100]}:{n >= 6}")
+        self.sset("deferred", sorted(next_retry))
+        self.sset("cursor", quiet_until.isoformat())
 
     # ------------------------------------------------------------------
     # one booking
     # ------------------------------------------------------------------
-    def process(self, deal_id: str) -> str | None:
+    def process(self, deal_id: str, xero_changed: bool = True) -> str | None:
         deal = self.hs.get("deals", deal_id, DEAL_PROPS)
         p = deal["properties"]
         name = p.get("dealname") or deal_id
         managed = (p.get("samiad_managed") or "").lower() == "true"
+
+        # only this season's bookings: a returner's old deal must never be re-invoiced
+        created = _hs_time(p.get("createdate"))
+        if created and created.date() < self.s.season_start:
+            return None
 
         if p.get("dealstage") not in self.hs.closed_won_stages():
             if managed:
@@ -141,22 +179,16 @@ class Service:
                            [f"{name}: the deal was moved out of Closed Won after it was invoiced. "
                             "Nothing has been changed in Xero; please check."], once_sig=p.get("dealstage"))
             return None
+        if (p.get("samiad_status") or "").startswith("Not managed") or \
+                (self.sget(f"status:{deal_id}") or "").startswith("Not managed"):
+            return None
 
         # safeguard: only act once the deal has sat at Closed Won for an hour
-        entered = _hs_time(p.get("hs_v2_date_entered_current_stage"))
-        if not managed and entered and self.now - entered < ONE_HOUR:
+        entered = _hs_time(p.get("hs_v2_date_entered_current_stage")) or _hs_time(p.get("closedate"))
+        if not managed and (entered is None or self.now - entered < ONE_HOUR):
             return "defer"
 
-        # cutover: never touch bookings invoiced before switch-on
-        if not managed:
-            if (p.get("samiad_status") or "").startswith("Not managed"):
-                return None
-            existing = self.xero.any_invoice_for_deal(deal_id)
-            if existing:
-                self.set_status(deal_id, "Not managed - invoiced before switch-on ("
-                                + ", ".join(existing[:3]) + ")")
-                return None
-
+        # everything below up to the Xero reads uses HubSpot only
         contacts = self.hs.deal_contacts(deal_id)
         students = [Student(c["id"], dict(c["properties"])) for c in contacts
                     if (c["properties"].get("contact_type") or "") == "Student"]
@@ -174,17 +206,27 @@ class Service:
             if not b2b and not parent:
                 raise BlockedError("No Parent / Guardian contact is attached to this deal")
             lines = booking_lines(students, basis)
+            owner = self.hs.owner(p.get("hubspot_owner_id")) if p.get("hubspot_owner_id") else None
+            if not owner or not owner.get("email"):
+                raise BlockedError("The deal has no owner")
         except BlockedError as e:
             self.set_status(deal_id, f"Blocked: {e}")
             self.alert(deal_id, "Booking can't be invoiced yet", [f"{name}: {e}"], once_sig=str(e))
+            return "blocked"
+
+        # skip the Xero reads when nothing that matters has changed (saves the daily API budget)
+        fingerprint = "|".join([basis.value, p.get("approve_change") or "", p.get("dealstage") or "",
+                                *[f"{l.description}={l.amount}" for l in lines]])
+        if managed and not xero_changed and self.sget(f"fp:{deal_id}") == fingerprint:
             return None
 
-        owner = self.hs.owner(p.get("hubspot_owner_id")) if p.get("hubspot_owner_id") else None
-        if not owner or not owner.get("email"):
-            self.set_status(deal_id, "Blocked: deal has no owner")
-            self.alert(deal_id, "Booking can't be invoiced yet", [f"{name}: the deal has no owner."],
-                       once_sig="no-owner")
-            return None
+        # cutover: never touch bookings invoiced before switch-on
+        if not managed:
+            foreign = [n for n in self.xero.any_invoice_for_deal(deal_id) if not OWN_NUMBER(deal_id, n)]
+            if foreign:
+                self.set_status(deal_id, "Not managed - invoiced before switch-on ("
+                                + ", ".join(foreign[:3]) + ")")
+                return None
 
         customer = (company["properties"].get("name") if b2b else
                     f"{parent['properties'].get('firstname') or ''} {parent['properties'].get('lastname') or ''}".strip())
@@ -210,41 +252,69 @@ class Service:
                            once_sig=str(e)[:80])
 
         chain, raw = self.xero.chain(deal_id)
+        if chain.base is None and (managed or chain.docs):
+            # we invoiced this before, but the base invoice is gone (voided/deleted): don't recreate
+            self.set_status(deal_id, "Blocked: base invoice missing or voided in Xero")
+            self.alert(deal_id, "Invoice missing in Xero",
+                       [f"{name}: invoice {deal_id} was voided or deleted in Xero.",
+                        "Nothing new has been created. Please check and re-raise by hand if needed."],
+                       once_sig="no-base")
+            return None
         base_match = True
         if chain.base:
-            want = sorted((l.description, str(l.amount)) for l in lines)
-            base_match = invoice_line_signature(raw[chain.base.number]) == want
+            base_match = invoice_line_signature(raw[chain.base.number]) == lines_signature(lines)
         decision = decide(chain, lines, self.s.approval_threshold, base_lines_match=base_match)
 
-        approved = (p.get("approve_change") or "").lower() == "true"
+        # stop a Xero quirk turning into an hourly "REVISED" loop
+        if decision.action is Action.EDIT_BASE and not decision.void_topups and \
+                self.sget(f"edited:{deal_id}") == fingerprint:
+            self.alert(deal_id, "Invoice lines won't match", [
+                f"{name}: invoice {deal_id} was edited but Xero still shows different lines.",
+                "No further changes or emails will be sent until someone checks it."], once_sig=fingerprint)
+            return None
+
+        # approval is tied to one specific change
+        sig = f"{decision.action.value}:{decision.amount}"
+        ticked = (p.get("approve_change") or "").lower() == "true"
+        approved = ticked and self.sget(f"pending:{deal_id}") == sig
+        if ticked and not approved:
+            self.write(deal_id, "clear stale approval tick", self.hs.update, "deals", deal_id,
+                       {"approve_change": "false"})
+            if decision.needs_approval:
+                self.alert(deal_id, "Approval cleared - the change has moved on",
+                           [f"{name}: the tick was for a different change. Now needed: "
+                            f"{decision.action.value} of £{decision.amount}. Please tick again."], once_sig=sig)
         if decision.needs_approval and not approved:
-            sig = f"{decision.action.value}:{decision.amount}"
+            self.sset(f"pending:{deal_id}", sig)
             self.set_status(deal_id, f"Waiting for approval: {decision.action.value} £{decision.amount}")
             self.alert(deal_id, "Booking change needs approval",
                        [f"{name}: {decision.action.value} of £{decision.amount}.",
                         *[f"Why: {r}" for r in decision.reasons],
                         "To approve, tick 'Approve change' on the deal. It goes through on the next run."],
                        once_sig=sig)
-            return None
+            return "blocked"
 
         changed = decision.action is not Action.NONE
         if decision.action is Action.CREATE_BASE:
             self.create_base(ctx, target)
         elif decision.action is Action.EDIT_BASE:
             self.edit_base(ctx, chain, raw, decision)
+            self.sset(f"edited:{deal_id}", fingerprint)
         elif decision.action is Action.TOP_UP:
             self.top_up(ctx, chain, decision.amount)
         elif decision.action is Action.CREDIT:
             self.credit(ctx, chain, raw, decision.amount)
 
         if changed:
+            self.sset(f"pending:{deal_id}", None)
             if approved:
                 self.write(deal_id, "clear approval", self.hs.update, "deals", deal_id, {"approve_change": "false"})
             if not self.s.shadow_mode:
                 chain, raw = self.xero.chain(deal_id)
 
         self.payments(ctx, chain)
-        if not (self.store.get(f"status:{deal_id}") or "").startswith("OK"):
+        self.sset(f"fp:{deal_id}", fingerprint)
+        if not (self.sget(f"status:{deal_id}") or "").startswith("OK"):
             self.set_status(deal_id, "OK")
         return None
 
@@ -259,7 +329,8 @@ class Service:
         existing = rec["properties"].get("xero_contact_id") or ""
         if self.s.shadow_mode:
             return existing or "shadow-contact"
-        cid = self.xero.find_or_create_contact(ctx.customer, existing)
+        acct = f"HS-{'C' if ctx.b2b else 'P'}-{rec['id']}"
+        cid = self.xero.find_or_create_contact(ctx.customer, existing, acct)
         if cid != existing:
             self.hs.update(obj, rec["id"], {"xero_contact_id": cid})
         return cid
@@ -290,7 +361,7 @@ class Service:
         base = raw[chain.base.number]
         self.write(ctx.deal_id, f"edit invoice {chain.base.number} to £{decision.amount}",
                    self.xero.replace_invoice_lines, base["InvoiceID"], ctx.lines, self.s.account_codes,
-                   ctx.ministay, f"edit-{ctx.deal_id}-{decision.amount}")
+                   ctx.ministay, f"edit-{ctx.deal_id}-{lines_hash(ctx.lines)}")
         reason = f"invoice updated from £{chain.invoiced} to £{decision.amount}"
         self.file_and_send_confirmation(ctx, decision.amount, revised=reason)
         self.send_xero_invoice_to_owner(ctx, base["Contact"]["ContactID"], base["InvoiceID"])
@@ -302,7 +373,8 @@ class Service:
         line = Line(f"{ctx.name} - booking change {date.today():%d %b %Y}", amount, "topup", "")
         inv = self.write(ctx.deal_id, f"create top-up {number} £{amount}", self.xero.create_invoice,
                          contact_id=contact_id, number=number, reference=ctx.name, lines=[line],
-                         codes={**self.s.account_codes, "topup": self.s.account_codes["topup"]},
+                         codes={**self.s.account_codes, "topup": self.s.account_codes[
+                             "course_ministay" if ctx.ministay else "topup"]},
                          ministay=ctx.ministay, due=date.today() + timedelta(days=self.s.payment_terms_days),
                          idem=f"topup-{number}")
         reason = f"price up £{amount}, top-up invoice {number}"
@@ -349,9 +421,8 @@ class Service:
 
     def next_version(self, ctx: "Ctx", kind: str) -> int:
         key = f"ver:{ctx.deal_id}:{kind}"
-        v = (self.store.get(key) or 0) + 1
-        if not self.s.shadow_mode:
-            self.store.set(key, v)
+        v = (self.sget(key) or 0) + 1
+        self.sset(key, v)
         return v
 
     def booking_docs(self, ctx: "Ctx", total: Decimal, received=ZERO, outstanding=ZERO) -> docs.BookingDocs:
@@ -405,7 +476,7 @@ class Service:
         p = ctx.props
         status = payment_status(chain).value
         paid, outstanding = chain.paid, chain.outstanding
-        last_paid = money(self.store.get(f"paid:{ctx.deal_id}", p.get("total_paid")))
+        last_paid = money(self.sget(f"paid:{ctx.deal_id}", p.get("total_paid")))
         updates = {}
         if money(p.get("total_paid")) != paid:
             updates["total_paid"] = str(paid)
@@ -429,15 +500,14 @@ class Service:
             self.write(ctx.deal_id, f"email receipt to {ctx.owner['email']}", self.graph.send_mail,
                        self.s.mail_from, [ctx.owner["email"]], f"Receipt - {ctx.name} ({ctx.deal_id})",
                        html, [(f"{stem}.pdf", pdf)])
-            if not self.s.shadow_mode:
-                self.store.set(f"paid:{ctx.deal_id}", str(paid))
+            self.sset(f"paid:{ctx.deal_id}", str(paid))
 
-        if half_paid(chain) and not p.get("visa_pack_sent_date") and not self.store.get(f"visa:{ctx.deal_id}"):
+        if half_paid(chain) and not p.get("visa_pack_sent_date") and not self.sget(f"visa:{ctx.deal_id}"):
             self.send_visa_pack(ctx, chain)
 
     def send_visa_pack(self, ctx: "Ctx", chain: Chain):
         folder = self.folder(ctx)
-        vv = self.store.get(f"ver:{ctx.deal_id}:visa") or 1
+        vv = self.sget(f"ver:{ctx.deal_id}:visa") or 1
         b = self.booking_docs(ctx, chain.invoiced)
         attachments = []
         for i, st in enumerate(ctx.students):
@@ -455,10 +525,9 @@ class Service:
         self.write(ctx.deal_id, f"email visa pack to {ctx.owner['email']}", self.graph.send_mail,
                    self.s.mail_from, [ctx.owner["email"]],
                    f"Visa letters & pre-arrival - {ctx.name} ({ctx.deal_id})", html, attachments)
+        self.sset(f"visa:{ctx.deal_id}", date.today().isoformat())  # before anything else can fail
         self.write(ctx.deal_id, "set visa_pack_sent_date", self.hs.update, "deals", ctx.deal_id,
                    {"visa_pack_sent_date": date.today().isoformat()})
-        if not self.s.shadow_mode:
-            self.store.set(f"visa:{ctx.deal_id}", date.today().isoformat())
         self.note(ctx, "50% paid: visa letters and pre-arrival pack emailed to the deal owner.")
 
 

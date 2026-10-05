@@ -77,6 +77,12 @@ def daily_report(svc) -> list[str]:
     for d in uninvoiced[:25]:
         issues.append(f"{d['properties'].get('dealname')}: Closed Won over 24 hours ago but not invoiced")
 
+    from datetime import date as _date
+    yesterday = (_date.today() - timedelta(days=1)).isoformat()
+    used = svc.store.get(f"xero_calls:{yesterday}") or 0
+    if used > 700:
+        issues.append(f"Xero API use yesterday was {used} of the 1,000 free daily calls: "
+                      "consider Xero's Core tier or fewer runs")
     if s.shadow_mode:
         issues.insert(0, "Shadow mode is ON: nothing was written to Xero, HubSpot, Teams files or email.")
     return issues
