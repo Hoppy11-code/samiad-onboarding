@@ -16,6 +16,7 @@ def _load_dotenv(path: Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
+        v = v.split(" #", 1)[0]  # allow "KEY=value   # comment"
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
@@ -31,7 +32,14 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str:
 
 def _bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
-    return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
+    if v is None or not v.strip():
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError(f"{name} must be true or false, got {v!r}")  # never guess on shadow mode
 
 
 DEFAULT_ACCOUNT_CODES = {
