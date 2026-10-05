@@ -119,6 +119,16 @@ class Xero:
                 return out
             page += 1
 
+    def all_credit_notes(self) -> list[dict]:
+        out, page = [], 1
+        while True:
+            batch = self._req("GET", "/CreditNotes", params={
+                "page": page, "where": 'Type=="ACCRECCREDIT"'}).json().get("CreditNotes", [])
+            out.extend(batch)
+            if len(batch) < 100:
+                return out
+            page += 1
+
     # ---- contacts ---------------------------------------------------------
     def find_or_create_contact(self, name: str, existing_id: str = "") -> str:
         if existing_id:

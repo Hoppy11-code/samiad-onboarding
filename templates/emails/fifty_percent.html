@@ -1,0 +1,10 @@
+{# PLACEHOLDER WORDING - replace with Samiad's real 50% email when supplied #}
+<p>Hi {{ owner_first }},</p>
+<p>{{ deal_name }} ({{ deal_id }}) has now paid at least 50% (£{{ received }} of £{{ total }}).</p>
+<p>Attached are the visa letter{{ "s" if visa_count > 1 else "" }}{% if pre_arrival_guide_url %} and the pre-arrival guide link below{% endif %}. Please forward to {{ customer_name }}.</p>
+<ul>
+{% if pre_arrival_guide_url %}<li>Pre-arrival guide: <a href="{{ pre_arrival_guide_url }}">{{ pre_arrival_guide_url }}</a></li>{% endif %}
+{% if pre_arrival_page_url %}<li>Pre-arrival page: <a href="{{ pre_arrival_page_url }}">{{ pre_arrival_page_url }}</a></li>{% endif %}
+{% if english_test_url %}<li>Online English test: <a href="{{ english_test_url }}">{{ english_test_url }}</a></li>{% endif %}
+</ul>
+<p>Samiad bookings</p>

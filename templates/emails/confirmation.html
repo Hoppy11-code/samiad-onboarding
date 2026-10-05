@@ -1,0 +1,6 @@
+<p>Hi {{ owner_first }},</p>
+<p>{{ deal_name }} ({{ deal_id }}) is booked. Attached is the confirmation &amp; invoice{% if revised %} (<b>revised</b>: {{ reason }}){% endif %}.</p>
+<p>Xero will send you a second email with the invoice and the Flywire payment link. Please forward both to {{ customer_name }}.</p>
+<p>Total: <b>£{{ total }}</b>{% if basis == "Gross" %} (gross){% endif %}.</p>
+<p>Word versions are in Teams if anything needs changing: <a href="{{ folder_url }}">{{ folder_name }}</a></p>
+<p>Samiad bookings</p>
