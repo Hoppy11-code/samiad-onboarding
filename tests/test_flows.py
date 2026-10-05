@@ -344,3 +344,41 @@ def test_shadow_mode_writes_nothing(env, tmp_path):
     assert not xero.invoices and not graph.mail and not graph.files
     assert "samiad_managed" not in hs.deals["900000000001"]
     assert any((tmp_path / "shadow").rglob("*.docx"))   # documents still produced locally to compare
+
+
+def test_ministay_waits_for_address_then_sends(env):
+    from samiad.rules import PIPELINE_MINISTAY
+    svc, hs, xero, graph, teams = env
+    hs.deals["900000000001"]["pipeline"] = PIPELINE_MINISTAY
+    hs.companies["c1"] = {"name": "Agency X"}                    # no basis set: Ministay is net anyway
+    hs.deal_company_map["900000000001"] = "c1"
+    svc.process("900000000001")
+    assert xero.invoices["900000000001"]["Total"] == D("1362")   # net
+    xero.pay("900000000001", "700")
+    svc.process("900000000001", xero_changed=True)
+    assert not any(m["subject"].startswith("Visa letters") for m in graph.mail)
+    assert any(t == "Ministay visa letters need the address" for t, _ in teams.posts)
+    # staff type the address into the Word file in Teams
+    from samiad import documents as docs
+    key = next(k for k in graph.files if "Visa Letter" in k)
+    import io
+    import docx as _docx
+    from docx.oxml.ns import qn
+    d = _docx.Document(io.BytesIO(graph.files[key]))
+    for t in d.element.body.iter(qn("w:t")):
+        if t.text and docs.MINISTAY_ADDRESS_PLACEHOLDER in t.text:
+            t.text = t.text.replace(docs.MINISTAY_ADDRESS_PLACEHOLDER, "12 Host Street")
+    buf = io.BytesIO()
+    d.save(buf)
+    graph.files[key] = buf.getvalue()
+    svc.process("900000000001", xero_changed=True)
+    assert any(m["subject"].startswith("Visa letters") for m in graph.mail)
+
+
+def test_test_mode_sends_everything_to_one_inbox_and_limits_deals(env):
+    svc, hs, xero, graph, teams = env
+    svc.s = replace(svc.s, test_email_to="alex@samiad.com", only_deals=frozenset({"900000000001"}))
+    assert svc.process("999999999999") is None
+    svc.process("900000000001")
+    assert graph.mail[0]["to"] == ["alex@samiad.com"]
+    assert set(xero.contact_emails.values()) == {"alex@samiad.com"}

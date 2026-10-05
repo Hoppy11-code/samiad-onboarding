@@ -163,6 +163,8 @@ class Service:
     # one booking
     # ------------------------------------------------------------------
     def process(self, deal_id: str, xero_changed: bool = True) -> str | None:
+        if self.s.only_deals and deal_id not in self.s.only_deals:
+            return None  # testing: only the listed deals
         deal = self.hs.get("deals", deal_id, DEAL_PROPS)
         p = deal["properties"]
         name = p.get("dealname") or deal_id
@@ -209,6 +211,8 @@ class Service:
             owner = self.hs.owner(p.get("hubspot_owner_id")) if p.get("hubspot_owner_id") else None
             if not owner or not owner.get("email"):
                 raise BlockedError("The deal has no owner")
+            if self.s.test_email_to:  # testing: everything goes to one inbox
+                owner = {**owner, "email": self.s.test_email_to}
         except BlockedError as e:
             self.set_status(deal_id, f"Blocked: {e}")
             self.alert(deal_id, "Booking can't be invoiced yet", [f"{name}: {e}"], once_sig=str(e))
@@ -509,12 +513,20 @@ class Service:
         folder = self.folder(ctx)
         vv = self.sget(f"ver:{ctx.deal_id}:visa") or 1
         b = self.booking_docs(ctx, chain.invoiced)
-        attachments = []
+        words = []
         for i, st in enumerate(ctx.students):
             fname = f"Visa Letter v{vv} - {_safe(st.name)}.docx"
             word = None if self.s.shadow_mode else self.graph.download(folder, fname)  # staff edits win
-            word = word or docs.visa_docx(b, i, ministay=ctx.ministay)
-            attachments.append((fname.replace(".docx", ".pdf"), docs.to_pdf(word)))
+            words.append((fname, word or docs.visa_docx(b, i, ministay=ctx.ministay)))
+        missing = [f for f, w in words if docs.MINISTAY_ADDRESS_PLACEHOLDER in docs.docx_text(w)]
+        if missing:
+            self.alert(ctx.deal_id, "Ministay visa letters need the address", [
+                f"{ctx.name} has reached 50% but {len(missing)} visa letter(s) still say "
+                f"{docs.MINISTAY_ADDRESS_PLACEHOLDER}.",
+                "Type the address into the Word file(s) in Teams; the pack goes out on the next run."],
+                once_sig=str(len(missing)))
+            return
+        attachments = [(f.replace(".docx", ".pdf"), docs.to_pdf(w)) for f, w in words]
         html = emails.render("fifty_percent.html", owner_first=ctx.owner["name"].split(" ")[0],
                              deal_name=ctx.name, deal_id=ctx.deal_id, customer_name=ctx.customer,
                              received=docs.gbp(chain.paid), total=docs.gbp(chain.invoiced),

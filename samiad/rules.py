@@ -89,6 +89,8 @@ class BlockedError(Exception):
 def billing_basis(pipeline: str, agent_billing_basis: str | None) -> Basis:
     if pipeline in B2C_PIPELINES:
         return Basis.NET
+    if pipeline == PIPELINE_MINISTAY:
+        return Basis.NET  # Ministay groups are always invoiced net, whatever the agent's setting
     if pipeline in B2B_PIPELINES:
         value = (agent_billing_basis or "").strip().lower()
         if value == "net":

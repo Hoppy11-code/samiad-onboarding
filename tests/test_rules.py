@@ -34,7 +34,11 @@ def test_b2c_is_always_net_even_if_agent_says_gross():
 def test_b2b_follows_agent_basis():
     assert r.billing_basis(r.PIPELINE_B2B_NEW, "Gross") is Basis.GROSS
     assert r.billing_basis(r.PIPELINE_B2B_EXISTING, "net") is Basis.NET
-    assert r.billing_basis(r.PIPELINE_MINISTAY, "Net") is Basis.NET
+
+
+def test_ministay_always_net_even_for_gross_or_unset_agents():
+    assert r.billing_basis(r.PIPELINE_MINISTAY, "Gross") is Basis.NET
+    assert r.billing_basis(r.PIPELINE_MINISTAY, None) is Basis.NET
 
 
 def test_b2b_without_basis_is_blocked():

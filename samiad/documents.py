@@ -139,14 +139,27 @@ def receipt_docx(b: BookingDocs) -> bytes:
     return _render(f"receipt_{_suffix(b.basis)}.docx", ctx)
 
 
+MINISTAY_ADDRESS_PLACEHOLDER = "[ADD MINISTAY ADDRESS]"
+
+
 def visa_docx(b: BookingDocs, student_index: int, ministay: bool = False) -> bytes:
-    """Ministay uses the same (group) letter; only the address differs."""
-    import os
+    """Ministay uses the same group letter; staff type the address into the Word file in Teams."""
     ctx = b.context()
     ctx["s"] = ctx["students"][student_index]
-    if ministay and os.environ.get("MINISTAY_ADDRESS"):
-        ctx["s"]["campus_address"] = os.environ["MINISTAY_ADDRESS"]
+    if ministay:
+        ctx["s"]["campus_address"] = MINISTAY_ADDRESS_PLACEHOLDER
     return _render(f"visa_{_suffix(b.basis)}.docx", ctx)
+
+
+def docx_text(docx_bytes: bytes) -> str:
+    """All visible text in a Word file (body and tables), for simple checks."""
+    import docx as _docx
+    d = _docx.Document(BytesIO(docx_bytes))
+    parts = [p.text for p in d.paragraphs]
+    for t in d.tables:
+        for row in t.rows:
+            parts.extend(c.text for c in row.cells)
+    return "\n".join(parts)
 
 
 def to_pdf(docx_bytes: bytes) -> bytes:

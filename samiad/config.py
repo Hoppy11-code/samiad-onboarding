@@ -84,6 +84,9 @@ class Settings:
     sharepoint_folder: str          # e.g. General/Applications/2027
     mail_from: str                  # bookings@samiad.com
     teams_webhook_url: str
+    # testing
+    test_email_to: str              # if set, every email (and Xero's) goes here instead of the deal owner
+    only_deals: frozenset           # if set, only these deal IDs are processed
     # optional AI summary
     anthropic_api_key: str
     claude_model: str
@@ -120,6 +123,8 @@ def load() -> Settings:
         sharepoint_folder=_env("SHAREPOINT_FOLDER", "General/Applications/2027"),
         mail_from=_env("MAIL_FROM", "bookings@samiad.com"),
         teams_webhook_url=_env("TEAMS_WEBHOOK_URL"),
+        test_email_to=_env("TEST_EMAIL_TO"),
+        only_deals=frozenset(x.strip() for x in _env("ONLY_DEALS").split(",") if x.strip()),
         anthropic_api_key=_env("ANTHROPIC_API_KEY"),
         claude_model=_env("CLAUDE_MODEL", "claude-sonnet-5-5"),
     )
