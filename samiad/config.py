@@ -46,9 +46,9 @@ def _bool(name: str, default: bool) -> bool:
 DEFAULT_ACCOUNT_CODES = {
     "course": "203",           # Summer School Sales
     "course_ministay": "205",  # Sales - Mini stay
-    "airport_transfer_fee": "203",
-    "insurance_fee__": "203",
-    "pre_post_online_course__": "203",
+    "airport_transfer_fee": "209",      # Sales - Airport Transfers
+    "insurance_fee__": "207",           # Sales - Student Insurance
+    "pre_post_online_course__": "208",  # Sales - Online English
     "ensuite_supplement": "203",
     "unaccompanied_minor_fee": "203",
     "topup": "203",
