@@ -50,7 +50,7 @@ DEFAULT_ACCOUNT_CODES = {
     "insurance_fee__": "207",           # Sales - Student Insurance
     "pre_post_online_course__": "208",  # Sales - Online English
     "ensuite_supplement": "203",
-    "unaccompanied_minor_fee": "203",
+    "unaccompanied_minor_fee": "210",   # Sales - Unaccompanied Minor
     "topup": "203",
 }
 

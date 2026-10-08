@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 
 import docx
+from docx.enum.text import WD_BREAK
+from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -224,6 +226,36 @@ def fill_cell_with_loop(cell, field: str, list_expr: str = "s.lines") -> None:
     new_paragraph_like(keep, "{%p endfor %}", before=False)
 
 
+def set_cell_border(cell, side: str, val: str = "single") -> None:
+    """Set one border of a table cell (e.g. 'top' to 'single'), keeping the others."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+    edge = borders.find(qn(f"w:{side}"))
+    if edge is None:
+        edge = OxmlElement(f"w:{side}")
+        borders.insert(0, edge) if side == "top" else borders.append(edge)
+    edge.set(qn("w:val"), val)
+    if val != "nil":
+        edge.set(qn("w:sz"), "4")
+        edge.set(qn("w:space"), "0")
+        edge.set(qn("w:color"), "auto")
+
+
+def widen_column(table, col: int, extra: int) -> None:
+    """Make column `col` wider by `extra` twips, taking the space from the next column."""
+    grid = table._tbl.find(qn("w:tblGrid")).findall(qn("w:gridCol"))
+    for g, delta in ((grid[col], extra), (grid[col + 1], -extra)):
+        g.set(qn("w:w"), str(int(g.get(qn("w:w"))) + delta))
+    for tr in table._tbl.findall(qn("w:tr")):
+        tcs = tr.findall(qn("w:tc"))
+        for tc, delta in ((tcs[col], extra), (tcs[col + 1], -extra)):
+            w = tc.find(qn("w:tcPr")).find(qn("w:tcW"))
+            w.set(qn("w:w"), str(int(w.get(qn("w:w"))) + delta))
+
+
 def insert_row_like(row, text: str, before: bool):
     el = copy.deepcopy(row._tr)
     (row._tr.addprevious if before else row._tr.addnext)(el)
@@ -268,6 +300,10 @@ def prepare_confirmation(src: Path, dst: Path, gross: bool) -> None:
     end = docx.text.paragraph.Paragraph(copy.deepcopy(heading._p), heading._parent)
     set_text(end, "{%p endfor %}")
     fees._tbl.addnext(end._p)
+    # each further student starts on a new page, so one student's details are never split
+    new_paragraph_like(end, "{%p if not loop.last %}", before=True)
+    new_paragraph_like(end, "", before=True).add_run().add_break(WD_BREAK.PAGE)
+    new_paragraph_like(end, "{%p endif %}", before=True)
 
     d.save(dst)
 
@@ -316,6 +352,12 @@ def prepare_receipt(src: Path, dst: Path) -> None:
     for label, val in (("Received:", "£{{ received }}"), ("Outstanding:", "£{{ outstanding }}")):
         lp = new_paragraph_like(lp, label, before=False)
         ap = new_paragraph_like(ap, val, before=False)
+    # box the totals off from the last student, like the line between students
+    for c in unique_cells(totals_row):
+        set_cell_border(c, "top", "single")
+
+    # header table: the "Address:" column was too narrow, so its colon wrapped onto a line of its own
+    widen_column(d.tables[0], 0, extra=450)
 
     # enquiries box: deal owner instead of Sam Allen
     for p in all_paragraphs(d):

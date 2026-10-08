@@ -15,8 +15,9 @@ def test_addons_have_their_own_income_accounts():
              Line("Kid - Insurance", Decimal("12"), "insurance_fee__", "s1"),
              Line("Kid - Pre/post online English course", Decimal("90"), "pre_post_online_course__", "s1"),
              Line("Kid - Airport transfers", Decimal("120"), "airport_transfer_fee", "s1"),
-             Line("Kid - Ensuite supplement", Decimal("60"), "ensuite_supplement", "s1")]
-    assert codes_for(lines) == ["203", "207", "208", "209", "203"]
+             Line("Kid - Ensuite supplement", Decimal("60"), "ensuite_supplement", "s1"),
+             Line("Kid - Unaccompanied minor service", Decimal("150"), "unaccompanied_minor_fee", "s1")]
+    assert codes_for(lines) == ["203", "207", "208", "209", "203", "210"]
 
 
 def test_ministay_course_still_on_ministay_sales_but_addons_split_out():
