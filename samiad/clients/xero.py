@@ -16,6 +16,10 @@ API = "https://api.xero.com/api.xro/2.0"
 SCOPES = ("openid profile email offline_access accounting.invoices accounting.payments "
           "accounting.contacts accounting.settings.read")
 DEAL_ID = re.compile(r"^(\d{9,13})(?:-(?:CN)?\d+)?$")
+# a shared mail provider says nothing about which agency someone works for
+PUBLIC_EMAIL_DOMAINS = {"gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "yahoo.de", "hotmail.com",
+                        "hotmail.co.uk", "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "aol.com",
+                        "gmx.de", "gmx.net", "web.de", "qq.com", "163.com", "126.com", "mail.ru", "yandex.ru"}
 
 
 def _xero_date(value) -> date | None:
@@ -113,12 +117,20 @@ class Xero:
         return Chain(deal_id, docs), raw
 
     def any_invoice_for_deal(self, deal_id: str) -> list[str]:
-        """Numbers of ANY sales invoice mentioning this deal ID (used for cutover)."""
-        where = f'InvoiceNumber.Contains("{deal_id}") AND Type=="ACCREC" AND Status!="VOIDED" AND Status!="DELETED"'
-        invs = self._req("GET", "/Invoices", params={"where": where}).json().get("Invoices", [])
+        """Numbers of ANY sales invoice mentioning this deal ID in its number or reference (used for cutover).
+
+        Hand-made invoices often carry Xero's own number (INV-0047) with the deal ID in the reference.
+        """
+        live = 'Type=="ACCREC" AND Status!="VOIDED" AND Status!="DELETED"'
+        found: dict[str, dict] = {}
+        for clause in (f'InvoiceNumber.Contains("{deal_id}")',
+                       f'Reference!=null AND Reference.Contains("{deal_id}")'):
+            for i in self._req("GET", "/Invoices", params={"where": f"{clause} AND {live}"}).json().get("Invoices", []):
+                found[i["InvoiceID"]] = i
         # Contains() would also match this ID inside a longer one; keep exact-ID hits only
         pat = re.compile(rf"(?<!\d){deal_id}(?!\d)")
-        return [i["InvoiceNumber"] for i in invs if pat.search(i["InvoiceNumber"])]
+        return [i["InvoiceNumber"] for i in found.values()
+                if pat.search(i["InvoiceNumber"]) or pat.search(i.get("Reference") or "")]
 
     def invoice(self, invoice_id: str) -> dict:
         return self._req("GET", f"/Invoices/{invoice_id}").json()["Invoices"][0]
@@ -149,12 +161,15 @@ class Xero:
             page += 1
 
     # ---- contacts ---------------------------------------------------------
-    def find_or_create_contact(self, name: str, existing_id: str = "", account_number: str = "") -> str:
+    def find_or_create_contact(self, name: str, existing_id: str = "", account_number: str = "",
+                               emails: list[str] = (), domain: str = "") -> str:
         """Xero contact for an agent company / parent, keyed by HubSpot record id.
 
         account_number (e.g. 'HS-C-123') is stored on the Xero contact, so two
-        customers with the same name never share a contact. Names must be
-        unique in Xero, so a clash gets ' (2)' etc.
+        customers with the same name never share a contact. Before creating one,
+        a contact staff already made by hand is reused (see match_contact), so
+        Xero doesn't fill up with duplicates. Names must be unique in Xero, so a
+        clash with a different customer gets ' (2)' etc.
         """
         if existing_id:
             return existing_id
@@ -163,6 +178,12 @@ class Xero:
                 "where": f'AccountNumber=="{account_number}"'}).json().get("Contacts", [])
             if found:
                 return found[0]["ContactID"]
+        match = self.match_contact(name, emails, domain, account_number)
+        if match:
+            if account_number and not match.get("AccountNumber"):
+                self._req("POST", f"/Contacts/{match['ContactID']}", json={"Contacts": [
+                    {"ContactID": match["ContactID"], "AccountNumber": account_number}]})
+            return match["ContactID"]
         safe = name.replace('"', "")
         candidate, n = safe, 1
         while True:
@@ -179,6 +200,45 @@ class Xero:
         resp = self._req("PUT", "/Contacts", idem=f"contact-{account_number or candidate}",
                          json={"Contacts": [body]}).json()
         return resp["Contacts"][0]["ContactID"]
+
+    def match_contact(self, name: str, emails: list[str] = (), domain: str = "",
+                      account_number: str = "") -> dict | None:
+        """An existing active Xero contact for this customer, or None.
+
+        Tried in order: same email, same name, then (agents) an email at the agent's own
+        web domain. Only a single clear match counts, and never one already tied to a
+        different HubSpot record (AccountNumber 'HS-...').
+        """
+        def usable(cs):
+            return [c for c in cs if c.get("ContactStatus", "ACTIVE") == "ACTIVE" and not (
+                (c.get("AccountNumber") or "").startswith("HS-") and c.get("AccountNumber") != account_number)]
+
+        def search(term):
+            return self._req("GET", "/Contacts", params={"searchTerm": term, "summaryOnly": "true"}
+                             ).json().get("Contacts", [])
+
+        def one(cs):
+            unique = {c["ContactID"]: c for c in usable(cs)}
+            return next(iter(unique.values())) if len(unique) == 1 else None
+
+        same_name = lambda c: c.get("Name", "").strip().lower() == name.strip().lower()  # noqa: E731
+        wanted = {e.strip().lower() for e in emails if e and e.strip()}
+        if wanted:
+            hits = [c for e in wanted for c in search(e) if (c.get("EmailAddress") or "").strip().lower() in wanted]
+            # Xero can already hold the same person twice: the one with the same name wins
+            found = one(hits) or one([c for c in hits if same_name(c)])
+            if found:
+                return found
+        if name.strip():
+            found = one([c for c in search(name.strip()) if same_name(c)])
+            if found:
+                return found
+        domain = domain.strip().lower().removeprefix("www.")
+        if domain and domain not in PUBLIC_EMAIL_DOMAINS:
+            hits = [c for c in search(domain) if (c.get("EmailAddress") or "").lower().endswith("@" + domain)]
+            if hits:
+                return one(hits)
+        return None
 
     def set_contact_email(self, contact_id: str, email: str) -> None:
         self._req("POST", f"/Contacts/{contact_id}",

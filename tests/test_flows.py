@@ -48,6 +48,7 @@ class FakeXero:
     def __init__(self):
         self.invoices, self.credit_notes, self.emailed, self.contact_emails = {}, {}, [], {}
         self.legacy = []
+        self.contact_lookups = []
 
     # reads
     def chain(self, deal_id):
@@ -70,7 +71,8 @@ class FakeXero:
         return [n for n in self.legacy if deal_id in n] + [n for n in self.invoices if deal_id in n]
 
     # writes
-    def find_or_create_contact(self, name, existing="", account_number=""):
+    def find_or_create_contact(self, name, existing="", account_number="", emails=(), domain=""):
+        self.contact_lookups.append({"name": name, "emails": list(emails), "domain": domain})
         return existing or f"contact-{name}"
 
     def set_contact_email(self, cid, email):
@@ -141,9 +143,11 @@ class FakeGraph:
 class FakeTeams:
     def __init__(self):
         self.posts = []
+        self.buttons = []
 
-    def post(self, title, lines, link=None):
+    def post(self, title, lines, link=None, links=()):
         self.posts.append((title, lines))
+        self.buttons.append([b for b in [*links, link] if b])
 
 
 def student(cid, net="1350", gross="1900", ins="12"):
@@ -159,7 +163,9 @@ def student(cid, net="1350", gross="1900", ins="12"):
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(flows.docs, "to_pdf", lambda b: b"%PDF fake")
-    s = replace(config.load(), shadow_mode=False, data_dir=tmp_path, sharepoint_folder="General/Applications/2027")
+    # only_deals / test_email_to come from a local .env during trials; tests must not depend on them
+    s = replace(config.load(), shadow_mode=False, data_dir=tmp_path, sharepoint_folder="General/Applications/2027",
+                only_deals=frozenset(), test_email_to="")
     hs, xero, graph, teams = FakeHubSpot(), FakeXero(), FakeGraph(), FakeTeams()
     svc = flows.Service(s, hs, xero, graph, teams, Store(tmp_path), now=NOW)
     entered = str(int((NOW - timedelta(hours=2)).timestamp() * 1000))
@@ -219,6 +225,69 @@ def test_new_b2c_booking_full_journey(env):
     hs.contacts["s1"] = student("s1", net="1450")
     svc.process("900000000001")
     assert xero.credit_notes["900000000001-CN1"]["Total"] == D("150")
+
+
+def test_invoicing_tells_teams_with_xero_check_and_folder_link(env):
+    svc, hs, xero, graph, teams = env
+    svc.process("900000000001")
+    (title, lines), buttons = teams.posts[-1], teams.buttons[-1]
+    assert title == "Booking invoiced: Rossi family"
+    assert any("Invoice 900000000001 created for £1362" in l for l in lines)
+    assert any(l.startswith("✅ Checked in Xero") and "£1362" in l for l in lines)
+    assert ("Open documents folder", "https://sharepoint/x") in buttons
+    assert any(t == "Open deal" for t, _ in buttons)
+
+    # a later change is announced as an update, still checked against Xero
+    hs.contacts["s1"] = student("s1", net="1500")
+    svc.process("900000000001")
+    assert teams.posts[-1][0] == "Booking updated: Rossi family"
+    assert any(l.startswith("✅ Checked in Xero") and "£1512" in l for l in teams.posts[-1][1])
+
+    # nothing changed: no post
+    n = len(teams.posts)
+    svc.process("900000000001")
+    assert len(teams.posts) == n
+
+
+def test_teams_flags_when_xero_total_does_not_match(env):
+    svc, hs, xero, graph, teams = env
+    real_create = xero.create_invoice
+
+    def short_create(**kw):  # Xero ends up holding less than we sent
+        inv = real_create(**kw)
+        inv["Total"] -= D(10)
+        return inv
+    xero.create_invoice = short_create
+    svc.process("900000000001")
+    assert any(l.startswith("⚠️ Xero shows £1352") for l in teams.posts[-1][1])
+
+
+def test_shadow_mode_announces_as_trial_without_folder_link(env):
+    svc, hs, xero, graph, teams = env
+    svc.s = replace(svc.s, shadow_mode=True)
+    svc.process("900000000001")
+    (title, lines), buttons = teams.posts[-1], teams.buttons[-1]
+    assert title.startswith("TRIAL - Booking invoiced")
+    assert any("nothing was actually created" in l for l in lines)
+    assert not any(t == "Open documents folder" for t, _ in buttons)
+    assert not xero.invoices
+
+
+def test_xero_contact_lookup_gets_parent_email_and_agent_details(env):
+    svc, hs, xero, graph, teams = env
+    fresh_deal = dict(hs.deals["900000000001"])
+    hs.contacts["p1"]["email"] = "maria@example.it"
+    svc.process("900000000001")
+    assert xero.contact_lookups[-1] == {"name": "Maria Rossi", "emails": ["maria@example.it"], "domain": ""}
+
+    hs.deals["900000000002"] = {**fresh_deal, "pipeline": PIPELINE_B2B_NEW}
+    hs.companies["c1"] = {"name": "Agency X", "billing_basis": "Net", "domain": "agencyx.com"}
+    hs.deal_company_map["900000000002"] = "c1"
+    hs.contacts["a1"] = {"contact_type": "Agent", "firstname": "Ana", "lastname": "X", "email": "ana@agencyx.com"}
+    hs.contacts["s2"] = student("s2")
+    hs.deal_contacts_map["900000000002"] = ["s2", "a1"]
+    svc.process("900000000002")
+    assert xero.contact_lookups[-1] == {"name": "Agency X", "emails": ["ana@agencyx.com"], "domain": "agencyx.com"}
 
 
 def test_b2b_without_billing_basis_is_blocked_and_alerts_once(env):
@@ -299,11 +368,21 @@ def test_old_student_record_on_this_years_deal_blocks(env):
     assert "Visiting year" in hs.deals["900000000001"]["samiad_status"]
 
 
-def test_blank_deal_year_falls_back_to_students(env):
+def test_blank_deal_year_is_left_alone(env):
     svc, hs, xero, graph, teams = env
     hs.deals["900000000001"].pop("visiting_year")
     svc.process("900000000001")
-    assert "900000000001" in xero.invoices
+    assert not xero.invoices and not teams.posts
+    assert "samiad_status" not in hs.deals["900000000001"]
+
+
+def test_blank_student_year_on_2027_deal_blocks(env):
+    svc, hs, xero, graph, teams = env
+    hs.contacts["s1"].pop("visiting_year")
+    svc.process("900000000001")
+    assert not xero.invoices
+    assert "Visiting year on Kid s1" in hs.deals["900000000001"]["samiad_status"]
+    assert teams.posts[-1][0] == "Booking can't be invoiced yet"
 
 
 def test_voided_base_on_managed_deal_is_not_recreated(env):

@@ -25,7 +25,7 @@ DEAL_PROPS = [
     "invoiced_date", "visa_pack_sent_date", "resync_to_xero", "approve_change",
     "samiad_managed", "samiad_status", "samiad_notes",
 ]
-COMPANY_PROPS = ["name", "billing_basis", "xero_contact_id", "hubspot_owner_id"]
+COMPANY_PROPS = ["name", "billing_basis", "xero_contact_id", "hubspot_owner_id", "domain"]
 PARENT_PROPS = ["firstname", "lastname", "email", "contact_type", "xero_contact_id"]
 
 

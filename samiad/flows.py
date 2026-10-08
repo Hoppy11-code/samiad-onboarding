@@ -98,14 +98,38 @@ class Service:
         self.sset(f"once:{key}", signature)
         return True
 
-    def alert(self, deal_id: str, title: str, lines: list[str], once_sig: str | None = None):
+    def alert(self, deal_id: str, title: str, lines: list[str], once_sig: str | None = None,
+              links: list[tuple[str, str]] = ()):
         if once_sig is not None and not self.once(f"alert:{deal_id}:{title}", once_sig):
             return
         link = ("Open deal", self.deal_url(deal_id)) if deal_id else None
         try:
-            self.teams.post(title, lines, link)
+            self.teams.post(title, lines, link, links=list(links))
         except Exception:  # never let a Teams hiccup stop the run
             log.exception("Teams post failed")
+
+    def announce(self, ctx: "Ctx", done: str, target: Decimal, chain: Chain | None, created: bool):
+        """Tell HQ a booking was invoiced or changed: what happened, the Xero check, and the files."""
+        n = len(ctx.students)
+        lines = [f"{ctx.customer} · {n} student{'s' if n != 1 else ''} · £{target} ({ctx.basis.value})",
+                 f"Xero: {done}"]
+        if chain is None:
+            lines.append("Trial run: nothing was actually created in Xero, SharePoint or email.")
+        elif chain.invoiced == target:
+            lines.append(f"✅ Checked in Xero: this booking's invoices now total £{chain.invoiced}, "
+                         "matching HubSpot.")
+        else:
+            lines.append(f"⚠️ Xero shows £{chain.invoiced} for this booking but HubSpot says £{target}. "
+                         "Please check Xero.")
+        lines.append("Documents: Confirmation & Invoice (Word + PDF) and visa letters (Word) are in the "
+                     "booking's folder." if chain is not None else
+                     f"Documents: saved on the trial computer in data/shadow/{ctx.deal_id}.")
+        lines.append(f"Emailed to {ctx.owner['name']} with the PDF; Xero emailed the invoice and payment link.")
+        title = (f"{'TRIAL - ' if chain is None else ''}"
+                 f"{'Booking invoiced' if created else 'Booking updated'}: {ctx.name}")
+        folder = self.folder_url(ctx)
+        self.alert(ctx.deal_id, title, lines,
+                   links=[("Open documents folder", folder)] if folder else [])
 
     def deal_url(self, deal_id: str) -> str:
         return f"https://app-eu1.hubspot.com/contacts/{self.s.hubspot_portal_id}/record/0-3/{deal_id}"
@@ -206,20 +230,18 @@ class Service:
         for st in students:
             st.props["_nights"] = docs.nights(st)
 
-        # only this season's bookings (Visiting year): a returner's old deal is never re-invoiced
+        # only this season's bookings: Visiting year must say the season on the deal AND on every
+        # student. Anything else is left alone, so older deals are never invoiced by mistake.
         season = self.s.season_label
-        deal_year = _year(p.get("visiting_year"))
+        if _year(p.get("visiting_year")) != season:
+            return None
         student_years = [_year(st.p("visiting_year")) for st in students]
-        if deal_year is None and not (student_years and all(y == season for y in student_years)):
-            return None
-        if deal_year is not None and deal_year != season:
-            return None
 
         try:
-            wrong = [st.name for st, y in zip(students, student_years) if y not in (None, season)]
+            wrong = [st.name for st, y in zip(students, student_years) if y != season]
             if wrong:
                 raise BlockedError(f"Visiting year on {', '.join(wrong)} isn't {season} "
-                                   "(an old student record may be attached)")
+                                   "(blank, or an old student record is attached)")
             if students and not all(docs.parse_date(st.p("arrival_dats")) for st in students):
                 raise BlockedError("A student has no arrival date")
             basis = billing_basis(pipeline, (company or {}).get("properties", {}).get("billing_basis"))
@@ -254,8 +276,10 @@ class Service:
 
         customer = (company["properties"].get("name") if b2b else
                     f"{parent['properties'].get('firstname') or ''} {parent['properties'].get('lastname') or ''}".strip())
+        agent_emails = [c["properties"]["email"] for c in contacts
+                        if (c["properties"].get("contact_type") or "").startswith("Agent") and c["properties"].get("email")]
         ctx = Ctx(deal_id, name, p, basis, students, lines, company, parent, b2b, customer, owner,
-                  pipeline == PIPELINE_MINISTAY)
+                  pipeline == PIPELINE_MINISTAY, agent_emails)
 
         # Rule 0: the deal's totals come from its students
         net_total = sum((s.stated_total(Basis.NET) for s in students), ZERO)
@@ -319,22 +343,25 @@ class Service:
             return "blocked"
 
         changed = decision.action is not Action.NONE
+        done = ""
         if decision.action is Action.CREATE_BASE:
-            self.create_base(ctx, target)
+            done = self.create_base(ctx, target)
         elif decision.action is Action.EDIT_BASE:
-            self.edit_base(ctx, chain, raw, decision)
+            done = self.edit_base(ctx, chain, raw, decision)
             self.sset(f"edited:{deal_id}", fingerprint)
         elif decision.action is Action.TOP_UP:
-            self.top_up(ctx, chain, decision.amount)
+            done = self.top_up(ctx, chain, decision.amount)
         elif decision.action is Action.CREDIT:
-            self.credit(ctx, chain, raw, decision.amount)
+            done = self.credit(ctx, chain, raw, decision.amount)
 
         if changed:
             self.sset(f"pending:{deal_id}", None)
             if approved:
                 self.write(deal_id, "clear approval", self.hs.update, "deals", deal_id, {"approve_change": "false"})
             if not self.s.shadow_mode:
-                chain, raw = self.xero.chain(deal_id)
+                chain, raw = self.xero.chain(deal_id)  # read back: proves what Xero now holds
+            self.announce(ctx, done, target, None if self.s.shadow_mode else chain,
+                          created=decision.action is Action.CREATE_BASE)
 
         self.payments(ctx, chain)
         self.sset(f"fp:{deal_id}", fingerprint)
@@ -354,7 +381,12 @@ class Service:
         if self.s.shadow_mode:
             return existing or "shadow-contact"
         acct = f"HS-{'C' if ctx.b2b else 'P'}-{rec['id']}"
-        cid = self.xero.find_or_create_contact(ctx.customer, existing, acct)
+        if ctx.b2b:
+            emails, domain = ctx.agent_emails, rec["properties"].get("domain") or ""
+        else:
+            emails, domain = [rec["properties"].get("email") or ""], ""
+        cid = self.xero.find_or_create_contact(ctx.customer, existing, acct,
+                                               emails=[e for e in emails if e], domain=domain)
         if cid != existing:
             self.hs.update(obj, rec["id"], {"xero_contact_id": cid})
         return cid
@@ -377,7 +409,9 @@ class Service:
         self.file_and_send_confirmation(ctx, target, revised=None)
         if inv:
             self.send_xero_invoice_to_owner(ctx, contact_id, inv["InvoiceID"])
-        self.note(ctx, f"Invoice {ctx.deal_id} created for £{target} ({ctx.basis.value}).")
+        done = f"Invoice {ctx.deal_id} created for £{target} ({ctx.basis.value})."
+        self.note(ctx, done)
+        return done
 
     def edit_base(self, ctx: "Ctx", chain: Chain, raw: dict, decision):
         for num in decision.void_topups:
@@ -389,7 +423,9 @@ class Service:
         reason = f"invoice updated from £{chain.invoiced} to £{decision.amount}"
         self.file_and_send_confirmation(ctx, decision.amount, revised=reason)
         self.send_xero_invoice_to_owner(ctx, base["Contact"]["ContactID"], base["InvoiceID"])
-        self.note(ctx, f"Invoice {chain.base.number} edited: {reason}.")
+        done = f"Invoice {chain.base.number} edited: {reason}."
+        self.note(ctx, done)
+        return done
 
     def top_up(self, ctx: "Ctx", chain: Chain, amount: Decimal):
         number = chain.next_number(credit=False)
@@ -405,7 +441,9 @@ class Service:
         self.file_and_send_confirmation(ctx, chain.invoiced + amount, revised=reason)
         if inv:
             self.send_xero_invoice_to_owner(ctx, contact_id, inv["InvoiceID"])
-        self.note(ctx, f"Top-up invoice {number} raised for £{amount}.")
+        done = f"Top-up invoice {number} raised for £{amount}."
+        self.note(ctx, done)
+        return done
 
     def credit(self, ctx: "Ctx", chain: Chain, raw: dict, amount: Decimal):
         number = chain.next_number(credit=True)
@@ -431,7 +469,9 @@ class Service:
                 "A refund (or carrying it forward) needs a person to arrange."], once_sig=number)
         reason = f"price down £{amount}, credit note {number}"
         self.file_and_send_confirmation(ctx, chain.invoiced - amount, revised=reason)
-        self.note(ctx, f"Credit note {number} raised for £{amount}.")
+        done = f"Credit note {number} raised for £{amount}."
+        self.note(ctx, done)
+        return done
 
     def note(self, ctx: "Ctx", text: str):
         self.write(ctx.deal_id, "note on deal", self.hs.add_deal_note, ctx.deal_id, f"[Automation] {text}")
@@ -504,8 +544,7 @@ class Service:
         updates = {}
         if money(p.get("total_paid")) != paid:
             updates["total_paid"] = str(paid)
-        if money(p.get("remaining_balance")) != outstanding:
-            updates["remaining_balance"] = str(outstanding)
+        # remaining_balance is a HubSpot calculated property (it rejects writes), so it isn't set here
         if (p.get("payment_status") or "") != status:
             updates["payment_status"] = status
         if updates:
@@ -567,7 +606,8 @@ class Ctx:
     """Everything known about one booking during a run."""
 
     def __init__(self, deal_id, name, props, basis, students, lines, company, parent, b2b,
-                 customer, owner, ministay):
+                 customer, owner, ministay, agent_emails=()):
         self.deal_id, self.name, self.props, self.basis = deal_id, name, props, basis
         self.students, self.lines, self.company, self.parent = students, lines, company, parent
         self.b2b, self.customer, self.owner, self.ministay = b2b, customer, owner, ministay
+        self.agent_emails = list(agent_emails)  # the agent's people on the deal: helps find their Xero contact

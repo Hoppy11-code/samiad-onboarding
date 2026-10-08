@@ -77,6 +77,8 @@ def check(svc: Service) -> int:
 
 def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # httpx logs every request URL at INFO; the Teams webhook URL carries its secret (sig=...)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     ap = argparse.ArgumentParser()
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--deal")

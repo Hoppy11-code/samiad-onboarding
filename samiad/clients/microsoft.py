@@ -15,8 +15,10 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 class Graph:
     def __init__(self, tenant_id: str, client_id: str, client_secret: str, site: str):
         self.tenant_id, self.client_id, self.client_secret = tenant_id, client_id, client_secret
-        self.site = site  # "samiad.sharepoint.com:/sites/HQ"
-        self.http = httpx.Client(timeout=120)
+        self.site = site  # "netorgft864411.sharepoint.com:/sites/SamiadHQ"
+        # file downloads (/content) answer with a redirect to a pre-signed URL; httpx drops the
+        # Authorization header when the redirect goes to another host, which is what Graph expects
+        self.http = httpx.Client(timeout=120, follow_redirects=True)
         self._tok, self._exp, self._site_id = None, 0.0, None
 
     def _token(self) -> str:
@@ -108,15 +110,17 @@ class Teams:
         self.url = webhook_url
         self.http = httpx.Client(timeout=30)
 
-    def post(self, title: str, lines: list[str], link: tuple[str, str] | None = None) -> None:
+    def post(self, title: str, lines: list[str], link: tuple[str, str] | None = None,
+             links: list[tuple[str, str]] = ()) -> None:
         if not self.url:
             return
         body = [{"type": "TextBlock", "text": title, "weight": "Bolder", "size": "Medium", "wrap": True}]
         body += [{"type": "TextBlock", "text": l, "wrap": True, "spacing": "Small"} for l in lines]
         card = {"type": "AdaptiveCard", "version": "1.4",
                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "body": body}
-        if link:
-            card["actions"] = [{"type": "Action.OpenUrl", "title": link[0], "url": link[1]}]
+        buttons = [l for l in [*links, link] if l and l[1]]
+        if buttons:
+            card["actions"] = [{"type": "Action.OpenUrl", "title": t, "url": u} for t, u in buttons]
         payload = {"type": "message", "attachments": [
             {"contentType": "application/vnd.microsoft.card.adaptive", "content": card}]}
         request(self.http, "Teams", "POST", self.url, json=payload)
